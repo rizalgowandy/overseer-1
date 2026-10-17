@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -36,6 +37,8 @@ type master struct {
 	binPath, tmpBinPath string
 	binPerms            os.FileMode
 	binHash             []byte
+	upgradeMux          sync.Mutex
+	activationRelease   func() // installer lock transferred from restart approval to cmd.Start
 	restartMux          sync.Mutex
 	restarting          bool
 	restartedAt         time.Time
@@ -45,6 +48,8 @@ type master struct {
 	signalledAt         time.Time
 	printCheckUpdate    bool
 	pendingRestart      bool
+	forceNext           bool
+	forkedHash          []byte
 }
 
 func (mp *master) run() error {
@@ -110,8 +115,10 @@ func (mp *master) setupSignalling() {
 	//updater-forker comms
 	mp.restarted = make(chan bool)
 	mp.descriptorsReleased = make(chan bool)
-	//read all master process signals
-	signals := make(chan os.Signal)
+	//read all master process signals. Buffer of 1 satisfies signal.Notify's
+	//requirement that the channel never block; the actual queueing for the
+	//fork window happens in handleSignal under workerMux.
+	signals := make(chan os.Signal, 1)
 	signal.Notify(signals)
 	go func() {
 		for s := range signals {
@@ -298,7 +305,10 @@ func (mp *master) fetch() {
 	}
 	//compare hash
 	newHash := hash.Sum(nil)
-	if bytes.Equal(mp.binHash, newHash) {
+	mp.restartMux.Lock()
+	unchanged := bytes.Equal(mp.binHash, newHash)
+	mp.restartMux.Unlock()
+	if unchanged {
 		mp.debugf("hash match - skip")
 		return
 	}
@@ -351,13 +361,43 @@ func (mp *master) fetch() {
 		mp.warnf("sanity check failed")
 		return
 	}
-	//overwrite!
+	// Serialize candidate replacement with activation authorization.
+	mp.upgradeMux.Lock()
+	mp.restartMux.Lock()
+	restarting = mp.restarting
+	mp.restartMux.Unlock()
+	if restarting {
+		mp.upgradeMux.Unlock()
+		return
+	}
+	release, err := mp.lockUpgrade()
+	if err != nil {
+		mp.upgradeMux.Unlock()
+		mp.warnf("upgrade lock: %s", err)
+		return
+	}
+	if mp.Config.AuthorizeUpgrade != nil {
+		if err := mp.Config.AuthorizeUpgrade(tmpBinPath); err != nil {
+			release()
+			mp.upgradeMux.Unlock()
+			mp.warnf("upgrade authorization deferred: %s", err)
+			return
+		}
+	}
 	if err := overwrite(mp.binPath, tmpBinPath); err != nil {
+		release()
+		mp.upgradeMux.Unlock()
 		mp.warnf("failed to overwrite binary: %s", err)
 		return
 	}
-	mp.debugf("upgraded binary (%x -> %x)", mp.binHash[:12], newHash[:12])
+	//binHash is read by fork() and info() on other goroutines
+	mp.restartMux.Lock()
+	oldHash := mp.binHash
 	mp.binHash = newHash
+	mp.restartMux.Unlock()
+	release()
+	mp.upgradeMux.Unlock()
+	mp.infof("upgraded binary (%x -> %x)", oldHash[:12], newHash[:12])
 	//binary successfully replaced
 	if !mp.Config.NoRestartAfterFetch {
 		mp.tryRestart()
@@ -378,43 +418,127 @@ func (mp *master) triggerRestart() {
 	mp.startRestart(false)
 }
 
+// forceNextRestart marks the next restart attempt to skip ShouldRestart;
+// backs the exported ForceNextRestart() function.
+func (mp *master) forceNextRestart() {
+	mp.restartMux.Lock()
+	mp.forceNext = true
+	mp.restartMux.Unlock()
+	mp.debugf("force next restart requested")
+}
+
+// info backs the exported MasterInfo() function.
+func (mp *master) info() Info {
+	mp.restartMux.Lock()
+	defer mp.restartMux.Unlock()
+	return Info{
+		IsMaster:       true,
+		UpgradeStaged:  mp.forkedHash != nil && !bytes.Equal(mp.forkedHash, mp.binHash),
+		RestartPending: mp.pendingRestart,
+		ForceRequested: mp.forceNext,
+		WorkerForks:    mp.workerID,
+	}
+}
+
 // startRestart atomically claims ownership of the restart and, if claimed,
 // performs the graceful shutdown handshake. When checkShouldRestart is true
 // the caller is the fetch loop and ShouldRestart may defer the restart.
 func (mp *master) startRestart(checkShouldRestart bool) {
+	mp.upgradeMux.Lock()
+	mp.restartMux.Lock()
+	if mp.restarting {
+		mp.restartMux.Unlock()
+		mp.upgradeMux.Unlock()
+		return
+	}
+	hasFork := mp.forkedHash != nil
+	mp.restartMux.Unlock()
+	release := func() {}
+	staged := false
+	if hasFork {
+		var err error
+		release, err = mp.lockUpgrade()
+		if err == nil {
+			var hash []byte
+			hash, err = binaryHash(mp.binPath)
+			if err == nil {
+				mp.restartMux.Lock()
+				mp.binHash = hash
+				staged = !bytes.Equal(mp.forkedHash, hash)
+				mp.restartMux.Unlock()
+			}
+		}
+		if err != nil {
+			mp.restartMux.Lock()
+			mp.pendingRestart = true
+			mp.restartMux.Unlock()
+			release()
+			mp.upgradeMux.Unlock()
+			mp.debugf("upgrade activation deferred: %s", err)
+			return
+		}
+	}
+	if staged && mp.Config.AuthorizeUpgrade != nil {
+		if err := mp.Config.AuthorizeUpgrade(mp.binPath); err != nil {
+			mp.restartMux.Lock()
+			mp.pendingRestart = true
+			mp.restartMux.Unlock()
+			release()
+			mp.upgradeMux.Unlock()
+			mp.debugf("upgrade activation deferred: %s", err)
+			return
+		}
+	}
 	mp.restartMux.Lock()
 	if mp.restarting {
 		mp.debugf("already graceful restarting")
 		mp.restartMux.Unlock()
+		release()
+		mp.upgradeMux.Unlock()
 		return
 	}
-	if checkShouldRestart && mp.Config.ShouldRestart != nil && !mp.Config.ShouldRestart() {
+	if checkShouldRestart && !mp.forceNext && mp.Config.ShouldRestart != nil && !mp.Config.ShouldRestart() {
 		if !mp.pendingRestart {
 			mp.debugf("restart deferred: ShouldRestart returned false")
 		}
 		mp.pendingRestart = true
 		mp.restartMux.Unlock()
+		release()
+		mp.upgradeMux.Unlock()
 		return
 	}
+	if checkShouldRestart && mp.forceNext {
+		mp.debugf("restart forced, skipping ShouldRestart")
+	}
 	mp.pendingRestart = false
-	if mp.workerCmd == nil {
+	mp.forceNext = false
+	mp.workerMux.Lock()
+	hasWorker := mp.workerCmd != nil
+	mp.workerMux.Unlock()
+	if !hasWorker {
 		mp.debugf("no worker process")
 		mp.restartMux.Unlock()
+		release()
+		mp.upgradeMux.Unlock()
 		return
 	}
 	mp.restarting = true
 	mp.awaitingUSR1 = true
 	mp.signalledAt = time.Now()
+	// Keep the approved path protected while the old worker drains. fork takes
+	// ownership and releases only after the replacement has actually started.
+	mp.activationRelease = release
 	mp.restartMux.Unlock()
-	mp.debugf("graceful restart triggered")
+	mp.upgradeMux.Unlock()
+	mp.infof("graceful restart triggered")
 	mp.sendSignal(mp.Config.RestartSignal) //ask nicely to terminate
 	select {
 	case <-mp.restarted:
 		//success
-		mp.debugf("restart success")
+		mp.infof("restart success")
 	case <-time.After(mp.TerminateTimeout):
 		//times up mr. process, we did ask nicely!
-		mp.debugf("graceful timeout, forcing exit")
+		mp.infof("graceful timeout (%s), forcing exit", mp.TerminateTimeout)
 		mp.sendSignal(os.Kill)
 	}
 }
@@ -430,7 +554,29 @@ func (mp *master) forkLoop() error {
 }
 
 func (mp *master) fork() error {
-	mp.debugf("starting %s", mp.binPath)
+	// A restart passes the installer lock from its pre-shutdown approval.
+	// Initial master startup instead trusts the explicitly started executable.
+	mp.upgradeMux.Lock()
+	mp.restartMux.Lock()
+	release := mp.activationRelease
+	mp.activationRelease = nil
+	mp.restartMux.Unlock()
+	if release == nil {
+		var err error
+		release, err = mp.lockUpgrade()
+		if err != nil {
+			release()
+			mp.upgradeMux.Unlock()
+			return fmt.Errorf("worker executable lock: %w", err)
+		}
+	}
+	unlock := func() { release(); mp.upgradeMux.Unlock() }
+	hash, err := binaryHash(mp.binPath)
+	if err != nil {
+		unlock()
+		return fmt.Errorf("worker executable hash: %w", err)
+	}
+	mp.infof("starting %s", mp.binPath)
 	cmd := exec.Command(mp.binPath)
 	//mark this new process as the "active" worker process.
 	//this process is assumed to be holding the socket files.
@@ -441,17 +587,24 @@ func (mp *master) fork() error {
 	mp.workerMux.Lock()
 	mp.workerCmd = cmd
 	mp.workerMux.Unlock()
+	//this fork runs the current on-disk binary: record its hash so info()
+	//can report whether a later upgrade is staged but not yet delivered
+	mp.restartMux.Lock()
 	mp.workerID++
+	workerID := mp.workerID
+	mp.binHash = hash
+	binID := hex.EncodeToString(hash)
+	mp.restartMux.Unlock()
 	//provide the worker process with some state. Set both the new
 	//OVERSEER_WORKER_* and legacy OVERSEER_SLAVE_* names so a pre-rename
 	//child binary forked by a post-rename master still detects itself as a
 	//worker and reads its id.
 	e := os.Environ()
-	e = append(e, envBinID+"="+hex.EncodeToString(mp.binHash))
+	e = append(e, envBinID+"="+binID)
 	e = append(e, envBinPath+"="+mp.binPath)
-	e = append(e, envWorkerID+"="+strconv.Itoa(mp.workerID))
+	e = append(e, envWorkerID+"="+strconv.Itoa(workerID))
 	e = append(e, envIsWorker+"=1")
-	e = append(e, envSlaveID+"="+strconv.Itoa(mp.workerID))
+	e = append(e, envSlaveID+"="+strconv.Itoa(workerID))
 	e = append(e, envIsSlave+"=1")
 	e = append(e, envNumFDs+"="+strconv.Itoa(len(mp.workerExtraFiles)))
 	cmd.Env = e
@@ -470,6 +623,13 @@ func (mp *master) fork() error {
 	} else {
 		cmd.Stderr = os.Stderr
 	}
+	// Bound cmd.Wait after process exit. When cmd.Stderr is a non-*os.File
+	// (e.g. our MultiWriter wrapping stderrTail), Go's exec creates a pipe
+	// and runs an internal goroutine to drain it. Worker subprocesses that
+	// inherit fd 2 (the pipe's write-end) and outlive the worker keep that
+	// pipe open forever; without WaitDelay, cmd.Wait blocks waiting for an
+	// EOF that never arrives, and the master never spawns the next worker.
+	cmd.WaitDelay = mp.Config.WaitDelay
 	//include socket files
 	cmd.ExtraFiles = mp.workerExtraFiles
 	if err := cmd.Start(); err != nil {
@@ -477,8 +637,13 @@ func (mp *master) fork() error {
 		mp.workerCmd = nil
 		mp.pendingSignals = nil
 		mp.workerMux.Unlock()
+		unlock()
 		return fmt.Errorf("Failed to start worker process: %s", err)
 	}
+	mp.restartMux.Lock()
+	mp.forkedHash = hash
+	mp.restartMux.Unlock()
+	unlock()
 	//drain any signals that arrived during the fork window
 	mp.workerMux.Lock()
 	pending := mp.pendingSignals
@@ -497,9 +662,23 @@ func (mp *master) fork() error {
 		mp.restartedAt = time.Now()
 		mp.restarting = false
 	}
+	//any successful fork runs the on-disk binary, satisfying a force request
+	//latched while a restart was already in flight
+	mp.forceNext = false
 	mp.restartMux.Unlock()
 	if wasRestarting {
-		mp.restarted <- true
+		// Non-blocking: if startRestart already exited via TerminateTimeout,
+		// nobody is reading mp.restarted. A blocking send here would hang the
+		// master forever — the worker is already running, no further progress
+		// is needed. Drop the notification in that case. The channel is
+		// unbuffered and only one restart can be in-flight at a time
+		// (guarded by mp.restarting), so racing a real receiver is not
+		// possible: startRestart enters its select before this send can run
+		// (it kicks off the worker death we are responding to).
+		select {
+		case mp.restarted <- true:
+		default:
+		}
 	}
 	//convert wait into channel
 	cmdwait := make(chan error)
@@ -510,17 +689,30 @@ func (mp *master) fork() error {
 	select {
 	case err := <-cmdwait:
 		//program exited before releasing descriptors
-		//proxy exit code out to master
+		//proxy exit code out to master. Prefer ProcessState (always set
+		//after the process exits) over the returned error, which may be
+		//wrapped — e.g. when WaitDelay force-closes I/O pipes, Wait returns
+		//a wrapper that doesn't directly type-assert to *exec.ExitError.
 		code := 0
-		if err != nil {
+		if cmd.ProcessState != nil {
+			code = cmd.ProcessState.ExitCode()
+			if code < 0 && err != nil {
+				code = 1
+			}
+		} else if err != nil {
 			code = 1
-			if exiterr, ok := err.(*exec.ExitError); ok {
+			var exiterr *exec.ExitError
+			if errors.As(err, &exiterr) {
 				if status, ok := exiterr.Sys().(syscall.WaitStatus); ok {
 					code = status.ExitStatus()
 				}
 			}
 		}
-		mp.debugf("prog exited with %d", code)
+		mp.infof("prog exited with %d", code)
+		if err != nil && cmd.ProcessState != nil && cmd.ProcessState.Exited() &&
+			strings.Contains(err.Error(), "WaitDelay") {
+			mp.warnf("WaitDelay (%s) elapsed while draining I/O — a subprocess likely inherited the worker's stderr pipe", mp.Config.WaitDelay)
+		}
 		if stderrTail != nil && mp.Config.OnPanic != nil {
 			if snap := opanic.Scan(stderrTail.Bytes(), mp.debugf); snap != nil {
 				// Run synchronously with a bounded deadline: os.Exit below
@@ -568,6 +760,12 @@ func (mp *master) debugf(f string, args ...interface{}) {
 	}
 }
 
+func (mp *master) infof(f string, args ...interface{}) {
+	if mp.Config.Debug || !mp.Config.NoWarn {
+		log.Printf("[overseer master] "+f, args...)
+	}
+}
+
 func (mp *master) warnf(f string, args ...interface{}) {
 	if mp.Config.Debug || !mp.Config.NoWarn {
 		log.Printf("[overseer master] "+f, args...)
@@ -587,4 +785,29 @@ func extension() string {
 	}
 
 	return ""
+}
+
+func (mp *master) lockUpgrade() (func(), error) {
+	if mp.Config.UpgradeLock == nil {
+		return func() {}, nil
+	}
+	release, err := mp.Config.UpgradeLock()
+	if release == nil {
+		release = func() {}
+	}
+	return release, err
+}
+
+// binaryHash reads the executable while its cooperating installer lock is held.
+func binaryHash(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := sha1.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return nil, err
+	}
+	return h.Sum(nil), nil
 }

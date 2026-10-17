@@ -55,7 +55,7 @@ type Config struct {
 	PreUpgrade func(tempBinaryPath string) error
 	//Debug enables all [overseer] logs.
 	Debug bool
-	//NoWarn disables warning [overseer] logs.
+	//NoWarn disables info and warning [overseer] logs.
 	NoWarn bool
 	//NoRestart disables all restarts, this option essentially converts
 	//the RestartSignal into a "ShutdownSignal".
@@ -71,6 +71,17 @@ type Config struct {
 	//subsequent fetch loop iteration until it returns true. Manual restarts
 	//via overseer.Restart() bypass this check.
 	ShouldRestart func() bool
+	// AuthorizeUpgrade is a mandatory check before replacing the executable and
+	// before activating a staged upgrade, including forced/manual restarts.
+	// It receives the candidate executable path and runs outside restart locks.
+	// Returning an error defers the upgrade; nil preserves historical behavior.
+	AuthorizeUpgrade func(binaryPath string) error
+	// UpgradeLock optionally serializes executable replacement and worker
+	// activation against external installers. A restart holds it from executable
+	// inspection and authorization through graceful shutdown until cmd.Start
+	// returns. The release is called once, possibly from another goroutine.
+	// A lock failure defers the operation.
+	UpgradeLock func() (release func(), err error)
 	//OnPanic, when non-nil, is invoked after the worker process exits if a
 	//Go panic/runtime crash is detected in its stderr. The snapshot is
 	//parsed by panicparse and contains the crashing goroutines. The
@@ -81,6 +92,13 @@ type Config struct {
 	//memory for panic detection. Only used when OnPanic is set. Defaults
 	//to 256 KiB.
 	StderrTailSize int
+	//WaitDelay bounds how long cmd.Wait blocks on the worker's stderr/stdout
+	//pipes after the process has exited. If a worker subprocess inherits the
+	//worker's pipe fd (e.g. via cmd.Stderr = os.Stderr where the worker's
+	//os.Stderr is itself the master→worker pipe) and outlives the worker,
+	//the pipe never EOFs and cmd.Wait hangs forever — blocking the master
+	//from spawning the next worker. Defaults to TerminateTimeout.
+	WaitDelay time.Duration
 }
 
 func validate(c *Config) error {
@@ -104,6 +122,9 @@ func validate(c *Config) error {
 	}
 	if c.MinFetchInterval <= 0 {
 		c.MinFetchInterval = 1 * time.Second
+	}
+	if c.WaitDelay <= 0 {
+		c.WaitDelay = c.TerminateTimeout
 	}
 	return nil
 }
@@ -158,9 +179,31 @@ func SanityCheck() {
 	}
 }
 
+// Info is a point-in-time snapshot of the master process's upgrade and
+// restart state, retrieved with MasterInfo.
+type Info struct {
+	//IsMaster reports whether this snapshot came from a master process.
+	//It is false in the worker and before Run.
+	IsMaster bool
+	//UpgradeStaged reports that the on-disk binary differs from the binary
+	//the current worker was forked from — an upgrade has been fetched and
+	//swapped into place but no restart has delivered it yet.
+	UpgradeStaged bool
+	//RestartPending reports that an automatic restart was deferred by
+	//Config.ShouldRestart and is being retried on each fetch loop iteration.
+	RestartPending bool
+	//ForceRequested reports that ForceNextRestart was called and the mark
+	//has not yet been consumed by a restart.
+	ForceRequested bool
+	//WorkerForks counts how many times the master has forked a worker.
+	WorkerForks int
+}
+
 // abstraction over master/worker
 var currentProcess interface {
 	triggerRestart()
+	forceNextRestart()
+	info() Info
 	run() error
 }
 
@@ -192,6 +235,28 @@ func Restart() {
 	if currentProcess != nil {
 		currentProcess.triggerRestart()
 	}
+}
+
+// ForceNextRestart marks the next restart attempt — typically the one
+// following the next successful fetch — to proceed even if
+// Config.ShouldRestart returns false. The mark is consumed when a restart
+// fires or a new worker is forked (any fork runs the current on-disk
+// binary, satisfying the request). Valid in the master process; no-op in
+// the worker.
+func ForceNextRestart() {
+	if currentProcess != nil {
+		currentProcess.forceNextRestart()
+	}
+}
+
+// MasterInfo returns a snapshot of the master's upgrade and restart state.
+// Valid in the master process; in the worker (or before Run) it returns a
+// zero Info with IsMaster=false.
+func MasterInfo() Info {
+	if currentProcess != nil {
+		return currentProcess.info()
+	}
+	return Info{}
 }
 
 // IsSupported returns whether overseer is supported on the current OS.

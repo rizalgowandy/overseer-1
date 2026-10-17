@@ -109,12 +109,12 @@ func (sp *worker) initFileDescriptors() error {
 }
 
 func (sp *worker) watchSignal() {
-	signals := make(chan os.Signal)
+	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, sp.Config.RestartSignal)
 	go func() {
 		<-signals
 		signal.Stop(signals)
-		sp.debugf("graceful shutdown requested")
+		sp.infof("graceful shutdown requested")
 		//master wants to restart,
 		close(sp.state.GracefulShutdown)
 		//release any sockets and notify master
@@ -134,7 +134,7 @@ func (sp *worker) watchSignal() {
 		//start death-timer
 		go func() {
 			time.Sleep(sp.Config.TerminateTimeout)
-			sp.debugf("timeout. forceful shutdown")
+			sp.infof("timeout. forceful shutdown")
 			os.Exit(1)
 		}()
 	}()
@@ -146,8 +146,23 @@ func (sp *worker) triggerRestart() {
 	}
 }
 
+func (sp *worker) forceNextRestart() {
+	//restart policy lives in the master; no-op here
+}
+
+func (sp *worker) info() Info {
+	//master state is not visible from the worker
+	return Info{}
+}
+
 func (sp *worker) debugf(f string, args ...interface{}) {
 	if sp.Config.Debug {
+		log.Printf("[overseer worker#"+sp.id+"] "+f, args...)
+	}
+}
+
+func (sp *worker) infof(f string, args ...interface{}) {
+	if sp.Config.Debug || !sp.Config.NoWarn {
 		log.Printf("[overseer worker#"+sp.id+"] "+f, args...)
 	}
 }
